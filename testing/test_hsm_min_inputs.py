@@ -74,7 +74,7 @@ def test_min_inputs_pairs_with_the_self_transfer_floor(dev, start_hsm, fake_txn,
     assert 'self-transfer' in stat.summary
 
     # Costs us nothing, but it is a round of two.
-    attempt_psbt(fake_txn(2, 1, dev.master_xpub, change_outputs=[0], fee=0),
+    attempt_psbt(fake_txn(2, [(None, None, True, None)], dev.master_xpub, fee=0),
                  'too few inputs: 2, need 4')
 
     hsm_reset()

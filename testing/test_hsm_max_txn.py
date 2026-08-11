@@ -53,7 +53,7 @@ def test_max_txn_combines_with_the_self_transfer_floor(dev, start_hsm, fake_txn,
     assert 'at most 1 transaction' in stat.summary
     assert 'self-transfer' in stat.summary
 
-    psbt = fake_txn(1, 1, dev.master_xpub, change_outputs=[0], fee=0)
+    psbt = fake_txn(1, [(None, None, True, None)], dev.master_xpub, fee=0)
     attempt_psbt(psbt)
     attempt_psbt(psbt, 'transaction count exceeded')
 

@@ -34,13 +34,13 @@ def test_feerate_cap_is_shown_and_enforced(dev, start_hsm, fake_txn, attempt_psb
 
     # Losing 9,800 sats over 98 vbytes is exactly 100,000 sats/kvB: at the limit, so allowed.
     assert (9800 * 1000) // OUR_VSIZE == 100000
-    at_limit = fake_txn(1, 2, dev.master_xpub, segwit_in=True, outstyles=['p2wpkh'],
-                        outvals=[99990200, 9800], change_outputs=[0], fee=0)
+    at_limit = fake_txn(1, [(None, 99990200, True, None), (None, 9800, False, None)],
+                        dev.master_xpub, fee=0)
     attempt_psbt(at_limit)
 
     # Twice the loss over the same bytes is twice the feerate.
-    over = fake_txn(1, 2, dev.master_xpub, segwit_in=True, outstyles=['p2wpkh'],
-                    outvals=[99980000, 20000], change_outputs=[0], fee=0)
+    over = fake_txn(1, [(None, 99980000, True, None), (None, 20000, False, None)],
+                    dev.master_xpub, fee=0)
     attempt_psbt(over, 'feerate too high')
 
     hsm_reset()
@@ -55,10 +55,9 @@ def test_feerate_catches_what_the_ratio_permits(dev, start_hsm, fake_txn, attemp
 
     start_hsm(policy)
 
-    passes_ratio_fails_feerate = fake_txn(1, 2, dev.master_xpub, segwit_in=True,
-                                          outstyles=['p2wpkh'],
-                                          outvals=[99000000, 1000000],
-                                          change_outputs=[0], fee=0)
+    passes_ratio_fails_feerate = fake_txn(
+        1, [(None, 99000000, True, None), (None, 1000000, False, None)],
+        dev.master_xpub, fee=0)
     attempt_psbt(passes_ratio_fails_feerate, 'feerate too high')
 
     hsm_reset()
@@ -73,12 +72,12 @@ def test_legacy_inputs_are_sized_too(dev, start_hsm, fake_txn, attempt_psbt, hsm
     start_hsm(policy)
 
     assert (18100 * 1000) // 181 == 100000
-    at_limit = fake_txn(1, 2, dev.master_xpub, outvals=[99981900, 18100],
-                        change_outputs=[0], fee=0)
+    at_limit = fake_txn(1, [(None, 99981900, True, None), (None, 18100, False, None)],
+                        dev.master_xpub, addr_fmt="p2pkh", fee=0)
     attempt_psbt(at_limit)
 
-    over = fake_txn(1, 2, dev.master_xpub, outvals=[99960000, 40000],
-                    change_outputs=[0], fee=0)
+    over = fake_txn(1, [(None, 99960000, True, None), (None, 40000, False, None)],
+                    dev.master_xpub, addr_fmt="p2pkh", fee=0)
     attempt_psbt(over, 'feerate too high')
 
     hsm_reset()
@@ -90,8 +89,8 @@ def test_absent_cap_changes_nothing(dev, start_hsm, fake_txn, attempt_psbt, hsm_
 
     start_hsm(policy)
 
-    psbt = fake_txn(1, 2, dev.master_xpub, segwit_in=True, outstyles=['p2wpkh'],
-                    outvals=[95000000, 5000000], change_outputs=[0], fee=0)
+    psbt = fake_txn(1, [(None, 95000000, True, None), (None, 5000000, False, None)],
+                    dev.master_xpub, fee=0)
     attempt_psbt(psbt)
 
     hsm_reset()
