@@ -104,7 +104,7 @@ def probe_system():
         hw_label = 'q1'
         has_battery = True
         has_qwerty = True
-        supports_hsm = False
+        supports_hsm = True     # kravens: re-enabled for coinjoin remote signing (HSM UX ported to Q LCD)
         # but, still mk_num = 4
     except ValueError:
         pass

@@ -83,7 +83,7 @@ if '--q1' in sys.argv:
     num_sd_slots = 2
     has_battery = True
     has_qwerty = True
-    supports_hsm = False
+    supports_hsm = True     # kravens: re-enabled for coinjoin remote signing
     mk_num = 4
 
 from public_constants import MAX_TXN_LEN, MAX_UPLOAD_LEN
