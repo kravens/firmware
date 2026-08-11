@@ -15,7 +15,6 @@ freeze_as_mpy('', [
 	'countdowns.py',
 	'descriptor.py',
 	'desc_utils.py',
-	'dev_helper.py',
 	'display.py',
 	'drv_entro.py',
 	'exceptions.py',
