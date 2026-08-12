@@ -184,6 +184,19 @@ class hsmUxInteraction:
     def draw_background(self):
         # Render and capture static parts of screen one-time.
         from glob import dis
+        from version import has_qwerty
+
+        if has_qwerty:
+            # Q1: 320x240 colour LCD addressed in 34x10 character cells. The Mk OLED code below
+            # writes the raw framebuffer (dis.dis.buffer / pixel coords), which does not exist here.
+            dis.clear()
+            dis.text(None, 0, 'HSM MODE')
+            dis.text(0, 2, 'Approved:')
+            dis.text(0, 3, 'Refused:')
+            dis.text(0, 4, 'Period left:')
+            dis.show()
+            return
+
         from display import FontTiny
 
         dis.clear()
@@ -225,9 +238,42 @@ class hsmUxInteraction:
 
     def show(self):
         from glob import dis, hsm_active
+        from version import has_qwerty
 
         # Plan: show "time til period reset", and some stats,
         # but never show amounts or private info.
+
+        if has_qwerty:
+            left = hsm_active.get_time_left()
+            if left is None:
+                left = 'n/a'
+            elif left == -1:
+                left = '--'
+            else:
+                left = period_display(left)
+
+            # redraw the three stat values; pad so a shorter value overwrites the longer old one.
+            def _cell(v):
+                v = str(v)
+                return v + (' ' * (10 - len(v)))
+            dis.text(13, 2, _cell(hsm_active.approvals % 10000))
+            dis.text(13, 3, _cell(hsm_active.refusals))
+            dis.text(13, 4, _cell(left))
+
+            # local confirmation code feedback (never the value itself once complete)
+            if self.digits:
+                shown = self.digits + ('#' * (LOCAL_PIN_LENGTH - len(self.digits)))
+                dis.text(0, 6, 'Local code: ' + shown)
+            else:
+                dis.text(0, 6, ' ' * 33)
+
+            # heartbeat: a single travelling dot on the top-right so an unattended screen looks alive
+            self.phase = (self.phase + 1) % len(cylon)
+            dis.text(-1, 0, '*' if (self.phase & 1) else ' ')
+
+            # contains a dis.show()
+            self.draw_busy(None, None)
+            return
 
         dis.dis.buffer[:] = self.screen_buf[:]
 
@@ -273,8 +319,36 @@ class hsmUxInteraction:
     update_contents = show
 
     def draw_busy(self, msg, percent):
-        from display import FontTiny, FontSmall
         from glob import dis
+        from version import has_qwerty
+
+        if has_qwerty:
+            # same busy-lifetime bookkeeping as the OLED path, rendered on the Q LCD instead.
+            if percent is not None:
+                self.percent = percent
+                if percent >= 0.995:            # done: clear it
+                    self.percent = None
+                    self.busy_text = msg = None
+                    self.busy_since = None
+            if msg is not None:
+                self.busy_text = msg
+            if msg is not None or percent is not None:
+                self.busy_since = utime.ticks_ms()
+            elif (self.busy_text is not None and self.busy_since is not None
+                    and utime.ticks_diff(utime.ticks_ms(), self.busy_since) > BUSY_TIMEOUT_MS):
+                # host went quiet mid-transfer: stop claiming to be busy
+                self.busy_text = None
+                self.percent = None
+                self.busy_since = None
+
+            bt = (self.busy_text or '')[:33]
+            dis.text(0, 8, bt + (' ' * (33 - len(bt))))
+            if self.percent is not None:
+                dis.progress_bar(self.percent)
+            dis.show()
+            return
+
+        from display import FontTiny, FontSmall
 
         self.last_percent = 0.5
 
@@ -330,6 +404,9 @@ class hsmUxInteraction:
         import glob
         from glob import numpad
         from uasyncio import sleep_ms
+        from version import has_qwerty
+        if has_qwerty:
+            from charcodes import KEY_ENTER, KEY_CANCEL, KEY_CLEAR, KEY_DELETE
 
         # Replace some drawing functions
         orig_fullscreen = glob.dis.fullscreen
@@ -353,6 +430,17 @@ class hsmUxInteraction:
             try:
                 # Poll for an event, no block
                 ch = numpad.get_nowait()
+
+                if has_qwerty and ch and ch != numpad.ABORT_KEY:
+                    # Map the Q keyboard onto the numeric-keypad semantics below: Enter submits,
+                    # Cancel/Clear/Delete resets, digits accumulate, everything else is ignored
+                    # (so typing the letters 'x'/'y' cannot clear or submit the local code).
+                    if ch == KEY_ENTER:
+                        ch = 'y'
+                    elif ch in (KEY_CANCEL, KEY_CLEAR, KEY_DELETE):
+                        ch = 'x'
+                    elif not ch.isdigit():
+                        ch = ''
 
                 if ch == 'x':
                     self.digits = ''

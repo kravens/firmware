@@ -115,9 +115,7 @@ def compute_policy_hash(policy):
 
 @pytest.fixture(autouse=True)
 def enable_hsm_commands(dev, sim_exec, is_q1):
-    if is_q1:
-        raise pytest.skip("Q does not have HSM support")
-
+    # kravens: the Q now supports HSM (coinjoin remote signing), so exercise it here too.
     cmd = 'from glob import settings; settings.set("hsmcmd", 1)'
     sim_exec(cmd)
     yield
