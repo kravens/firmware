@@ -343,8 +343,13 @@ class hsmUxInteraction:
 
             bt = (self.busy_text or '')[:33]
             dis.text(0, 8, bt + (' ' * (33 - len(bt))))
+            # Draw the progress as a text bar in a cell row. Do NOT call dis.progress_bar here: interact()
+            # monkeypatches it to route back into draw_busy, so calling it would recurse forever.
             if self.percent is not None:
-                dis.progress_bar(self.percent)
+                fill = int(33 * max(0.0, min(1.0, self.percent)))
+                dis.text(0, 9, ('=' * fill) + (' ' * (33 - fill)))
+            else:
+                dis.text(0, 9, ' ' * 33)
             dis.show()
             return
 
