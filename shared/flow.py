@@ -29,12 +29,17 @@ from public_constants import AF_P2WPKH_P2SH, AF_P2WPKH
 
 # Optional feature: HSM, depends on hardware
 # - code for HSM support won't exist on some platforms, so don't call it
+# - guard the import: if supports_hsm is set on a build whose manifest forgot to freeze hsm/users,
+#   a bare ImportError here (this is module-level, run during boot) takes the whole menu system
+#   down and wedges the device after login. Degrade to "HSM unavailable" instead of bricking.
+hsm_policy_available = False
+make_users_menu = None
 if version.supports_hsm:
-    from hsm import hsm_policy_available
-    from users import make_users_menu
-else:
-    hsm_policy_available = False
-    make_users_menu = None
+    try:
+        from hsm import hsm_policy_available
+        from users import make_users_menu
+    except ImportError:
+        pass
 
 # Q related items
 if version.has_battery:

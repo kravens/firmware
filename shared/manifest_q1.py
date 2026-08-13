@@ -5,6 +5,12 @@ freeze_as_mpy('', [
 	'calc.py',
 	'decoders.py',
 	'gpu.py',
+	# kravens: HSM support was Mk4-only (frozen via manifest_mk4). Enabling supports_hsm on the Q
+	# for coinjoin remote signing means these must be frozen here too, or flow.py's top-level
+	# `from hsm import hsm_policy_available` (and users) raises ImportError on the frozen build and
+	# the device wedges after login. The simulator loads from source so it never surfaced this.
+	'hsm.py',
+	'hsm_ux.py',
 	'keyboard.py',
 	'lcd_display.py',
 	'notes.py',
@@ -12,6 +18,7 @@ freeze_as_mpy('', [
 	'scanner.py',
 	'st7788.py',
 	'teleport.py',
+	'users.py',
 	'ux_q1.py'
 ], opt=0)
 
