@@ -925,9 +925,14 @@ async def start_login_sequence():
         # do not offer HSM if wallet is blank -> HSM needs secret
         if not pa.is_secret_blank():
             try:
-                import hsm, hsm_ux
+                # Check for a policy file BEFORE importing hsm_ux: that module pulls in the whole
+                # auth/psbt chain, which is a large allocation this early in boot and is pure waste
+                # on the overwhelmingly common path where no HSM policy exists. This runs before
+                # enable_usb(), so anything that wedges here leaves no way back into the device.
+                import hsm
 
                 if hsm.hsm_policy_available():
+                    import hsm_ux
                     settings.put("hsmcmd", True)
                     ar = await hsm_ux.start_hsm_approval(usb_mode=False, startup_mode=True)
                     if ar:
