@@ -4,7 +4,7 @@
 #
 # Run with:  py.test test_slip19.py
 #
-import pytest, struct, json
+import pytest, struct, json, time
 from hashlib import sha256
 from ckcc.protocol import CCProtocolPacker
 
@@ -32,10 +32,32 @@ def slp9_request(subpath, addr_fmt, flags, commitment=COMMITMENT):
 
 
 @pytest.fixture
-def slp9(dev):
-    def doit(subpath=SEGWIT_PATH, addr_fmt=AF_P2WPKH, flags=0, commitment=COMMITMENT):
-        return dev.send_recv(slp9_request(subpath, addr_fmt, flags, commitment))
+def slp9(dev, press_select):
+    # Outside HSM mode a human approves each proof, so the device answers with nothing and the
+    # host collects the result with 'slok'. Under a policy the proof comes straight back.
+    def doit(subpath=SEGWIT_PATH, addr_fmt=AF_P2WPKH, flags=0, commitment=COMMITMENT,
+             approve=True):
+        rv = dev.send_recv(slp9_request(subpath, addr_fmt, flags, commitment), timeout=None)
+        if rv is not None:
+            return rv
+
+        if approve:
+            press_select()
+        else:
+            # caller drives the refusal itself
+            return None
+
+        return poll_slok(dev)
     return doit
+
+
+def poll_slok(dev):
+    for _ in range(200):
+        rv = dev.send_recv(b'slok', timeout=None)
+        if rv is not None:
+            return rv
+        time.sleep(0.050)
+    raise RuntimeError('no proof from slok')
 
 
 def check_proof_shape(proof, flags, witness_items):
@@ -54,8 +76,7 @@ def check_proof_shape(proof, flags, witness_items):
     (AF_P2TR, TAPROOT_PATH, 1),         # single BIP-340 key-spend signature
 ])
 def test_slp9_proof_shapes(slp9, addr_fmt, subpath, witness_items):
-    # Both supported script types produce a well-formed proof outside HSM mode,
-    # so long as they do not claim a user confirmation that never happened.
+    # Both supported script types produce a well-formed proof once approved on screen.
     proof = slp9(subpath=subpath, addr_fmt=addr_fmt, flags=0)
     check_proof_shape(proof, flags=0, witness_items=witness_items)
 
@@ -77,12 +98,32 @@ def test_slp9_rejects_unsupported_addr_fmt(slp9):
     assert 'unsupported address format' in str(ee.value)
 
 
-def test_slp9_confirmation_flag_needs_hsm(slp9):
-    # The flag asserts to a coordinator that a human approved this input. Outside HSM mode
-    # nobody did, and the host chooses the flag, so the device must refuse to make the claim.
-    with pytest.raises(Exception) as ee:
-        slp9(flags=FLAG_USER_CONFIRMATION)
-    assert 'user confirmation' in str(ee.value)
+def test_slp9_outside_hsm_asks_on_screen(dev, cap_story, press_select):
+    # No policy, so a human must see what is being proven before it is signed. The story names
+    # the path and the address the proof is about.
+    dev.send_recv(slp9_request(SEGWIT_PATH, AF_P2WPKH, FLAG_USER_CONFIRMATION), timeout=None)
+
+    title, story = cap_story()
+    assert 'wnership' in (title + story)
+    assert SEGWIT_PATH.decode() in story
+    assert sha256(COMMITMENT).hexdigest() in story.lower()
+
+    press_select()
+    proof = poll_slok(dev)
+
+    # somebody did confirm, so the flag is now a claim the device can back
+    check_proof_shape(proof, flags=FLAG_USER_CONFIRMATION, witness_items=2)
+
+
+def test_slp9_outside_hsm_can_be_refused(dev, press_cancel):
+    # Refusing must produce no proof at all, not an unsigned or partial one.
+    from ckcc_protocol.protocol import CCUserRefused
+
+    dev.send_recv(slp9_request(SEGWIT_PATH, AF_P2WPKH, 0), timeout=None)
+    press_cancel()
+
+    with pytest.raises(CCUserRefused):
+        poll_slok(dev)
 
 
 def test_slp9_rejects_junk_path(slp9):

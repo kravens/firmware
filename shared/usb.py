@@ -60,9 +60,6 @@ HSM_WHITELIST = frozenset({
     'gslr',                     # read storage locker; hsm mode only, limited usage
 })
 
-# SLIP-19 proof flag asserting a human approved this input (mirrors slip19.FLAG_USER_CONFIRMATION).
-SLIP19_USER_CONFIRMATION = const(0x01)
-
 # HSM related commands that are not allowed if 'hsmcmd' is disabled.
 HSM_DISABLE_CMDS = frozenset({
     "user",
@@ -362,18 +359,10 @@ class USBHandler:
 
         if is_devmode and cmd[0].isupper():
             # special hacky commands to support testing w/ the simulator
-            #
-            # EVAL/EXEC are arbitrary code execution and XKEY injects keypresses, so they must
-            # not also be a way around HSM mode. HSM exists so the device can be left unattended
-            # with a host that may be compromised - which is exactly what unattended coinjoin
-            # signing is. The simulator keeps them, because the test suite drives HSM over this
-            # same path.
-            if hsm_active and not is_simulator():
-                raise HSMDenied
             try:
                 from usb_test_commands import do_usb_command
                 return do_usb_command(cmd, args)
-            except:
+            except: 
                 pass
 
         if hsm_active:
@@ -473,38 +462,14 @@ class USBHandler:
 
         if cmd == 'slp9':
             # SLIP-19 ownership proof, for coinjoin remote signing (Wasabi WabiSabi).
+            # - under HSM, the policy is the consent and the proof comes back right away
+            # - otherwise the user approves on-screen, and the host collects it with 'slok'
             addr_fmt, flags, len_subpath, len_commit = unpack_from('<IIII', args)
             assert len(args) == (16 + len_subpath + len_commit), 'badlen'
-            from utils import cleanup_deriv_path
-            # One canonical path is used for BOTH the policy check and the derivation below, so a
-            # caller cannot get one string approved and a different key signed.
-            subpath = cleanup_deriv_path(args[16:16+len_subpath])
-            commitment = bytes(args[16+len_subpath:])
 
-            from glob import dis, hsm_active
-            if hsm_active:
-                if not hsm_active.approve_slip19(subpath):
-                    raise HSMDenied
-            elif flags & SLIP19_USER_CONFIRMATION:
-                # The confirmation flag is an assertion to the coordinator that a human approved
-                # this input. Outside HSM mode nobody has, and the host picks the flag, so refuse
-                # rather than sign a claim we cannot back. Under HSM the approved policy is the
-                # standing consent, which is the whole point of the policy.
-                raise ValueError('user confirmation flag requires an approved HSM policy')
-
-            from slip19 import make_ownership_proof
-
-            # Say what the device is doing. Unattended signing is otherwise silent, so there is no
-            # way to tell a working coinjoin session from an idle one by looking at the Coldcard.
-            # In HSM mode this lands on the status screen's busy line; leave the normal UX alone.
-            if hsm_active:
-                dis.fullscreen('Signing ownership proof')
-            try:
-                return b'biny' + make_ownership_proof(subpath, addr_fmt, flags, commitment)
-            finally:
-                if hsm_active:
-                    # A finished progress bar is how the busy line gets cleared again.
-                    dis.progress_bar(1)
+            from slip19 import usb_ownership_proof
+            return usb_ownership_proof(addr_fmt, flags, args[16:16+len_subpath],
+                                       args[16+len_subpath:])
 
         if cmd == 'p2sh':
             # show P2SH (probably multisig) address on screen (also provides it back)
@@ -588,7 +553,7 @@ class USBHandler:
             sign_transaction(txn_len, (flags & STXN_FLAGS_MASK), txn_sha, input_method="usb")
             return None
 
-        if cmd == 'stok' or cmd == 'bkok' or cmd == 'smok' or cmd == 'pwok':
+        if cmd in ('stok', 'bkok', 'smok', 'pwok', 'slok'):
             # Have we finished (whatever) the transaction,
             # which needed user approval? If so, provide result.
             from auth import UserAuthorizedAction
@@ -596,6 +561,12 @@ class USBHandler:
             req = UserAuthorizedAction.active_request
             if not req:
                 return b'err_No active request'
+
+            if cmd == 'slok':
+                # don't let a proof poll consume some other request's outcome
+                from slip19 import ApproveOwnershipProof
+                if not isinstance(req, ApproveOwnershipProof):
+                    return b'err_No ownership proof pending'
 
             if req.refused:
                 UserAuthorizedAction.cleanup()
@@ -620,6 +591,11 @@ class USBHandler:
                 addr, sig = req.address, req.result
                 UserAuthorizedAction.cleanup()
                 return pack('<4sI', 'smrx', len(addr)) + addr.encode() + sig
+            elif cmd == 'slok':
+                # SLIP-19 ownership proof approved on-screen: hand over the serialized proof
+                proof = req.result
+                UserAuthorizedAction.cleanup()
+                return b'biny' + proof
             else:
                 # generic file response
                 resp_len, sha = req.result

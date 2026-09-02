@@ -5,17 +5,19 @@
 #
 # The wire result is the full serialized ownership proof: proof_body || bip322_sig
 # (bip322_sig = empty scriptSig (varint 0) || witness stack).
+#
+# Two ways in, both over the 'slp9' USB command:
+# - HSM mode: the policy's slip19_paths list is the standing consent, so the proof is returned
+#   at once (unattended coinjoin signing).
+# - otherwise: a human approves each proof on screen, exactly like message signing, and the
+#   host collects the result with 'slok'. Only then can the user-confirmation flag be honest.
 import ngu, stash
 from public_constants import AF_P2WPKH, AF_P2TR
+from serializations import ser_compact_size
+from auth import UserAuthorizedAction
 
 SLIP19_MAGIC = bytes([0x53, 0x4c, 0x00, 0x19])
 FLAG_USER_CONFIRMATION = 0x01
-
-def _cs(n):
-    # Bitcoin compact-size varint (values used here are small).
-    if n < 0xfd:
-        return bytes([n])
-    return bytes([0xfd, n & 0xff, (n >> 8) & 0xff])
 
 # --- SLIP-19 ownership identifier -------------------------------------------------
 # id = HMAC-SHA256(key = k, msg = scriptPubKey), where
@@ -24,41 +26,37 @@ def _cs(n):
 #   m          = HMAC-SHA512(key=b"Symmetric key seed", msg=seed)
 #   Child(N,l) = HMAC-SHA512(key=N[0:32], msg=b"\x00" + l)
 #   Key(N)     = N[32:64]
-# The key is cached against the master fingerprint. A different seed - including the same
-# words under a different BIP-39 passphrase - yields a different xfp, so a cached key can
-# never leak across wallets.
+# The key is cached against a hash of the root chain code: 256 bits of HMAC output, so unlike
+# the 32-bit fingerprint it cannot collide between two seeds, and it changes with the BIP-39
+# passphrase too, so a cached key can never leak across wallets.
 _oid_key_cache = None
 
 
-def _master_seed(sv):
-    # SLIP-21 needs the seed the BIP-32 tree was built from, not the tree itself.
-    if sv.mode == 'master':
-        return bytes(sv.raw)
-    if sv.mode == 'words':
-        # Re-derives through PBKDF2 (seconds); that cost is why the key is cached.
-        import bip39
-        return bip39.master_secret(bip39.b2a_words(sv.raw), sv._bip39pw)
-    # An xprv-imported secret has no seed, so no ownership identifier exists for it. Refuse
-    # rather than emit a proof carrying a made-up id.
-    raise ValueError('ownership proofs need a seed; this wallet was imported as xprv')
-
-
-def _ownership_id_key():
+def _ownership_id_key(sv):
     global _oid_key_cache
 
-    from glob import settings
-    xfp = settings.get('xfp', 0)
-    if _oid_key_cache is not None and _oid_key_cache[0] == xfp:
+    ident = ngu.hash.sha256s(sv.node.chain_code())
+    if _oid_key_cache is not None and _oid_key_cache[0] == ident:
         return _oid_key_cache[1]
 
-    with stash.SensitiveValues() as sv:
-        seed = _master_seed(sv)
-        try:
-            root = ngu.hmac.hmac_sha512(b'Symmetric key seed', seed)
-        finally:
-            # Only this one HMAC needs the seed, so it does not outlive the block. The
-            # intermediate nodes are seed-derived too, so each is blanked once consumed.
-            stash.blank_object(seed)
+    # SLIP-21 needs the seed the BIP-32 tree was built from, not the tree itself.
+    if sv.mode == 'master':
+        seed = bytes(sv.raw)
+    elif sv.mode == 'words':
+        # Re-derives through PBKDF2 (seconds); that cost is why the key is cached.
+        import bip39
+        seed = bip39.master_secret(bip39.b2a_words(sv.raw), sv._bip39pw)
+    else:
+        # An xprv-imported secret has no seed, so no ownership identifier exists for it. Refuse
+        # rather than emit a proof carrying a made-up id.
+        raise ValueError('ownership proofs need a seed; this wallet was imported as xprv')
+
+    try:
+        root = ngu.hmac.hmac_sha512(b'Symmetric key seed', seed)
+    finally:
+        # Only this one HMAC needs the seed, so it does not outlive the block. The
+        # intermediate nodes are seed-derived too, so each is blanked once consumed.
+        stash.blank_object(seed)
 
     n1 = ngu.hmac.hmac_sha512(root[0:32], b'\x00' + b'SLIP-0019')
     stash.blank_object(root)
@@ -67,13 +65,16 @@ def _ownership_id_key():
     k = bytes(n2[32:64])
     stash.blank_object(n2)
 
-    _oid_key_cache = (xfp, k)
+    _oid_key_cache = (ident, k)
     return k
 
 
-def ownership_id(spk):
+def ownership_id(spk, sv=None):
     # SLIP-19 ownership identifier for one of this wallet's scriptPubKeys.
-    return bytes(ngu.hmac.hmac_sha256(_ownership_id_key(), spk))
+    if sv is None:
+        with stash.SensitiveValues() as sv:
+            return ownership_id(spk, sv)
+    return bytes(ngu.hmac.hmac_sha256(_ownership_id_key(sv), spk))
 
 
 def _tagged_hash(tag, msg):
@@ -81,49 +82,62 @@ def _tagged_hash(tag, msg):
     th = ngu.hash.sha256s(tag)
     return ngu.hash.sha256s(th + th + msg)
 
-def make_ownership_proof(subpath, addr_fmt, flags, commitment):
-    # subpath: str like "m/84h/0h/0h/1/0"; addr_fmt: AF_P2WPKH or AF_P2TR; commitment: bytes.
+
+def _script_and_key(node, addr_fmt):
+    # For the key at this node: (scriptPubKey, what signs for it).
+    # - P2WPKH: (privkey, compressed pubkey), for an ECDSA/DER witness
+    # - P2TR (BIP-86 key-spend): the tweaked keypair, for a BIP-340 witness
+    if addr_fmt == AF_P2WPKH:
+        pubkey = node.pubkey()          # 33-byte compressed
+        h160 = ngu.hash.ripemd160(ngu.hash.sha256s(pubkey))
+        return bytes([0x00, 0x14]) + h160, (node.privkey(), pubkey)
+
+    # Tweak the internal key with the taproot tweak (no script tree). libsecp256k1's
+    # keypair_xonly_tweak_add handles the internal even-Y negation and output-key parity, so the
+    # resulting signature verifies against the tweaked output key in the scriptPubKey.
+    kp = ngu.secp256k1.keypair(node.privkey())
+    internal_xonly = kp.xonly_pubkey().to_bytes()               # 32-byte internal x-only key
+    out_kp = kp.xonly_tweak_add(_tagged_hash(b'TapTweak', internal_xonly))
+    out_xonly = out_kp.xonly_pubkey().to_bytes()                # 32-byte output x-only key
+    return bytes([0x51, 0x20]) + out_xonly, out_kp               # P2TR: OP_1 push32 <output key>
+
+
+def _check_addr_fmt(addr_fmt):
     # The caller states the address format, the same way smsg does. Deriving it from the path
     # purpose instead would be a guess: the purpose does not have to match the script actually
     # used at that path, and a proof over the wrong scriptPubKey is silently useless.
     assert addr_fmt in (AF_P2WPKH, AF_P2TR), 'unsupported address format for ownership proof'
 
+
+def make_ownership_proof(subpath, addr_fmt, flags, commitment):
+    # subpath: str like "m/84h/0h/0h/1/0"; addr_fmt: AF_P2WPKH or AF_P2TR; commitment: bytes.
+    _check_addr_fmt(addr_fmt)
+
     with stash.SensitiveValues() as sv:
         node = sv.derive_path(subpath)
-        pk = node.privkey()
-        pubkey = node.pubkey()          # 33-byte compressed
+        spk, signer = _script_and_key(node, addr_fmt)
+        oid = ownership_id(spk, sv)
+
+    proof_body = SLIP19_MAGIC + bytes([flags & 0xff]) + ser_compact_size(1) + oid
+    preimage = (proof_body + ser_compact_size(len(spk)) + spk
+                + ser_compact_size(len(commitment)) + commitment)
+    digest = ngu.hash.sha256s(preimage)
 
     if addr_fmt == AF_P2WPKH:
-        h160 = ngu.hash.ripemd160(ngu.hash.sha256s(pubkey))
-        spk = bytes([0x00, 0x14]) + h160
-        proof_body = SLIP19_MAGIC + bytes([flags & 0xff]) + _cs(1) + ownership_id(spk)
-        preimage = proof_body + _cs(len(spk)) + spk + _cs(len(commitment)) + commitment
-        digest = ngu.hash.sha256s(preimage)
+        pk, pubkey = signer
         sig65 = ngu.secp256k1.sign(pk, digest, 0).to_bytes()
-        r = sig65[1:33]
-        s = sig65[33:65]
-        der = _der_sig(r, s) + bytes([0x01])            # + SIGHASH_ALL
-        witness = _cs(2) + _cs(len(der)) + der + _cs(len(pubkey)) + pubkey
+        der = _der_sig(sig65[1:33], sig65[33:65]) + bytes([0x01])      # + SIGHASH_ALL
+        witness = (ser_compact_size(2) + ser_compact_size(len(der)) + der
+                   + ser_compact_size(len(pubkey)) + pubkey)
     else:
-        # P2TR (BIP-86 key-spend): tweak the internal key with the taproot tweak (no script tree),
-        # then sign the same SLIP-19 digest as a BIP-340 key-spend. libsecp256k1's
-        # keypair_xonly_tweak_add handles the internal even-Y negation and output-key parity, so the
-        # resulting signature verifies against the tweaked output key in the scriptPubKey.
-        kp = ngu.secp256k1.keypair(pk)
-        internal_xonly = kp.xonly_pubkey().to_bytes()               # 32-byte internal x-only key
-        out_kp = kp.xonly_tweak_add(_tagged_hash(b'TapTweak', internal_xonly))
-        out_xonly = out_kp.xonly_pubkey().to_bytes()                # 32-byte output x-only key
-        spk = bytes([0x51, 0x20]) + out_xonly                       # P2TR: OP_1 push32 <output key>
-        proof_body = SLIP19_MAGIC + bytes([flags & 0xff]) + _cs(1) + ownership_id(spk)
-        preimage = proof_body + _cs(len(spk)) + spk + _cs(len(commitment)) + commitment
-        digest = ngu.hash.sha256s(preimage)
         # aux_rand = 0: BIP-340 permits it; sign32 still binds (secret, message) so it is safe and
         # deterministic for a proof. Witness is a single key-spend sig (SigHash.Default -> 64 bytes).
-        sig = ngu.secp256k1.sign_schnorr(out_kp, digest, bytes(32))
-        witness = _cs(1) + _cs(len(sig)) + sig
+        sig = ngu.secp256k1.sign_schnorr(signer, digest, bytes(32))
+        witness = ser_compact_size(1) + ser_compact_size(len(sig)) + sig
 
-    bip322_sig = _cs(0) + witness       # empty scriptSig, then witness stack
+    bip322_sig = ser_compact_size(0) + witness       # empty scriptSig, then witness stack
     return proof_body + bip322_sig
+
 
 def _der_sig(r, s):
     def der_int(x):
@@ -137,3 +151,97 @@ def _der_sig(r, s):
         return bytes([0x02, len(x)]) + x
     body = der_int(r) + der_int(s)
     return bytes([0x30, len(body)]) + body
+
+
+# --- USB entry points --------------------------------------------------------------
+
+class ApproveOwnershipProof(UserAuthorizedAction):
+    # Outside HSM mode: show the human what is about to be proven, and sign only if they agree.
+    # Result is collected by the host over 'slok'.
+    def __init__(self, subpath, addr_fmt, flags, commitment):
+        super().__init__()
+        self.subpath = subpath
+        self.addr_fmt = addr_fmt
+        self.flags = flags
+        self.commitment = commitment
+
+        from glob import dis
+        dis.fullscreen('Wait...')
+
+        with stash.SensitiveValues() as sv:
+            node = sv.derive_path(subpath)
+            spk, _ = _script_and_key(node, addr_fmt)
+            self.address = sv.chain.render_address(spk)
+
+        dis.progress_bar_show(1)
+
+    async def interact(self):
+        from ux import ux_show_story
+        from utils import show_single_address, B2A
+
+        story = '''\
+Sign ownership proof?
+
+Proves to a coinjoin coordinator that this Coldcard owns:
+
+{subpath} =>
+{addr}
+
+Commitment (SHA256):
+{commit}
+
+Nothing is spent. The coordinator uses the proof to check the coin is yours before letting \
+it into a round.'''.format(subpath=self.subpath, addr=show_single_address(self.address),
+                            commit=B2A(ngu.hash.sha256s(self.commitment)))
+
+        ch = await ux_show_story(story, title='Ownership Proof')
+
+        if ch != 'y':
+            self.refused = True
+        else:
+            from glob import dis
+            dis.fullscreen('Signing...')
+            self.result = make_ownership_proof(self.subpath, self.addr_fmt, self.flags,
+                                               self.commitment)
+
+        self.done()
+
+
+def usb_ownership_proof(addr_fmt, flags, subpath, commitment):
+    # Handle the 'slp9' USB command. Returns the full response (b'biny' + proof) when it can be
+    # answered at once (HSM mode), or None once on-screen approval has been started.
+    from utils import cleanup_deriv_path
+    from glob import dis, hsm_active
+    from exceptions import HSMDenied
+
+    _check_addr_fmt(addr_fmt)
+
+    # One canonical path is used for BOTH the policy check and the derivation, so a caller
+    # cannot get one string approved and a different key signed.
+    subpath = cleanup_deriv_path(subpath)
+    commitment = bytes(commitment)
+
+    if not hsm_active:
+        # A human decides. The confirmation flag, if the host asked for it, is then a claim that
+        # somebody did in fact confirm.
+        UserAuthorizedAction.check_busy()
+        UserAuthorizedAction.active_request = ApproveOwnershipProof(subpath, addr_fmt, flags,
+                                                                    commitment)
+        from ux import abort_and_goto
+        abort_and_goto(UserAuthorizedAction.active_request)
+        return None
+
+    if not hsm_active.approve_slip19(subpath):
+        raise HSMDenied
+
+    # Say what the device is doing. Unattended signing is otherwise silent, so there is no way
+    # to tell a working coinjoin session from an idle one by looking at the Coldcard. This lands
+    # on the HSM status screen's busy line.
+    dis.fullscreen('Signing ownership proof')
+    try:
+        return b'biny' + make_ownership_proof(subpath, addr_fmt, flags, commitment)
+    finally:
+        # A finished progress bar is how the busy line gets cleared again.
+        dis.progress_bar(1)
+
+# EOF
