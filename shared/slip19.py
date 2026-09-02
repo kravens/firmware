@@ -15,6 +15,7 @@ import ngu, stash
 from public_constants import AF_P2WPKH, AF_P2TR
 from serializations import ser_compact_size
 from auth import UserAuthorizedAction
+from ux import OK, X
 
 SLIP19_MAGIC = bytes([0x53, 0x4c, 0x00, 0x19])
 FLAG_USER_CONFIRMATION = 0x01
@@ -155,9 +156,27 @@ def _der_sig(r, s):
 
 # --- USB entry points --------------------------------------------------------------
 
+PROOF_TEMPLATE = '''\
+Sign ownership proof?
+
+Proves to a coinjoin coordinator that this Coldcard owns:
+
+{subpath} =>
+{addr}
+
+Commitment (SHA256):
+{commit}
+
+Nothing is spent. The coordinator checks the coin is yours before letting it into a round.
+
+Press %s to continue, otherwise %s to cancel.''' % (OK, X)
+
+
 class ApproveOwnershipProof(UserAuthorizedAction):
     # Outside HSM mode: show the human what is about to be proven, and sign only if they agree.
-    # Result is collected by the host over 'slok'.
+    # Result is collected by the host over 'slok', which is the only poll command that may have it.
+    is_slip19 = True
+
     def __init__(self, subpath, addr_fmt, flags, commitment):
         super().__init__()
         self.subpath = subpath
@@ -179,20 +198,9 @@ class ApproveOwnershipProof(UserAuthorizedAction):
         from ux import ux_show_story
         from utils import show_single_address, B2A
 
-        story = '''\
-Sign ownership proof?
-
-Proves to a coinjoin coordinator that this Coldcard owns:
-
-{subpath} =>
-{addr}
-
-Commitment (SHA256):
-{commit}
-
-Nothing is spent. The coordinator uses the proof to check the coin is yours before letting \
-it into a round.'''.format(subpath=self.subpath, addr=show_single_address(self.address),
-                            commit=B2A(ngu.hash.sha256s(self.commitment)))
+        story = PROOF_TEMPLATE.format(subpath=self.subpath,
+                                      addr=show_single_address(self.address),
+                                      commit=B2A(ngu.hash.sha256s(self.commitment)))
 
         ch = await ux_show_story(story, title='Ownership Proof')
 
@@ -207,10 +215,11 @@ it into a round.'''.format(subpath=self.subpath, addr=show_single_address(self.a
         self.done()
 
 
-def usb_ownership_proof(addr_fmt, flags, subpath, commitment):
+def usb_ownership_proof(subpath, addr_fmt, flags, commitment):
     # Handle the 'slp9' USB command. Returns the full response (b'biny' + proof) when it can be
     # answered at once (HSM mode), or None once on-screen approval has been started.
     from utils import cleanup_deriv_path
+    from ux import abort_and_goto
     from glob import dis, hsm_active
     from exceptions import HSMDenied
 
@@ -227,7 +236,6 @@ def usb_ownership_proof(addr_fmt, flags, subpath, commitment):
         UserAuthorizedAction.check_busy()
         UserAuthorizedAction.active_request = ApproveOwnershipProof(subpath, addr_fmt, flags,
                                                                     commitment)
-        from ux import abort_and_goto
         abort_and_goto(UserAuthorizedAction.active_request)
         return None
 

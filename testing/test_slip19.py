@@ -31,26 +31,6 @@ def slp9_request(subpath, addr_fmt, flags, commitment=COMMITMENT):
             + subpath + commitment)
 
 
-@pytest.fixture
-def slp9(dev, press_select):
-    # Outside HSM mode a human approves each proof, so the device answers with nothing and the
-    # host collects the result with 'slok'. Under a policy the proof comes straight back.
-    def doit(subpath=SEGWIT_PATH, addr_fmt=AF_P2WPKH, flags=0, commitment=COMMITMENT,
-             approve=True):
-        rv = dev.send_recv(slp9_request(subpath, addr_fmt, flags, commitment), timeout=None)
-        if rv is not None:
-            return rv
-
-        if approve:
-            press_select()
-        else:
-            # caller drives the refusal itself
-            return None
-
-        return poll_slok(dev)
-    return doit
-
-
 def poll_slok(dev):
     for _ in range(200):
         rv = dev.send_recv(b'slok', timeout=None)
@@ -58,6 +38,20 @@ def poll_slok(dev):
             return rv
         time.sleep(0.050)
     raise RuntimeError('no proof from slok')
+
+
+@pytest.fixture
+def slp9(dev, press_select):
+    # Outside HSM mode a human approves each proof, so the device answers with nothing and the
+    # host collects the result with 'slok'. Under a policy the proof comes straight back.
+    def doit(subpath=SEGWIT_PATH, addr_fmt=AF_P2WPKH, flags=0, commitment=COMMITMENT):
+        rv = dev.send_recv(slp9_request(subpath, addr_fmt, flags, commitment), timeout=None)
+        if rv is not None:
+            return rv
+
+        press_select()
+        return poll_slok(dev)
+    return doit
 
 
 def check_proof_shape(proof, flags, witness_items):
@@ -104,7 +98,7 @@ def test_slp9_outside_hsm_asks_on_screen(dev, cap_story, press_select):
     dev.send_recv(slp9_request(SEGWIT_PATH, AF_P2WPKH, FLAG_USER_CONFIRMATION), timeout=None)
 
     title, story = cap_story()
-    assert 'wnership' in (title + story)
+    assert 'Ownership' in title
     assert SEGWIT_PATH.decode() in story
     assert sha256(COMMITMENT).hexdigest() in story.lower()
 
@@ -124,6 +118,20 @@ def test_slp9_outside_hsm_can_be_refused(dev, press_cancel):
 
     with pytest.raises(CCUserRefused):
         poll_slok(dev)
+
+
+def test_slp9_result_is_only_for_slok(dev, press_select):
+    # A pending proof must not be collectable as if it were a signed message: smok would
+    # otherwise hand back the proof wrapped in a message-signature response.
+    dev.send_recv(slp9_request(SEGWIT_PATH, AF_P2WPKH, 0), timeout=None)
+    press_select()
+
+    with pytest.raises(Exception) as ee:
+        dev.send_recv(b'smok', timeout=None)
+    assert 'Wrong completion command' in str(ee.value)
+
+    # and the proof is still there for its own poll
+    check_proof_shape(poll_slok(dev), flags=0, witness_items=2)
 
 
 def test_slp9_rejects_junk_path(slp9):

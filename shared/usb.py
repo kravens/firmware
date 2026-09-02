@@ -468,7 +468,7 @@ class USBHandler:
             assert len(args) == (16 + len_subpath + len_commit), 'badlen'
 
             from slip19 import usb_ownership_proof
-            return usb_ownership_proof(addr_fmt, flags, args[16:16+len_subpath],
+            return usb_ownership_proof(args[16:16+len_subpath], addr_fmt, flags,
                                        args[16+len_subpath:])
 
         if cmd == 'p2sh':
@@ -562,11 +562,10 @@ class USBHandler:
             if not req:
                 return b'err_No active request'
 
-            if cmd == 'slok':
-                # don't let a proof poll consume some other request's outcome
-                from slip19 import ApproveOwnershipProof
-                if not isinstance(req, ApproveOwnershipProof):
-                    return b'err_No ownership proof pending'
+            if getattr(req, 'is_slip19', False) != (cmd == 'slok'):
+                # an ownership proof is collected by 'slok' and nothing else, so neither poll
+                # can consume the other's result
+                return b'err_Wrong completion command'
 
             if req.refused:
                 UserAuthorizedAction.cleanup()
