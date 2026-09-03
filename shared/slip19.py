@@ -2,6 +2,7 @@
 # Produces a proof a coordinator verifier accepts: a signature over
 #   SHA256( proof_body || cs(scriptPubKey) || scriptPubKey || cs(commitment) || commitment )
 # where proof_body = magic(SL\x00\x19) || flags || varint(count) || 32-byte ownership id(s).
+# flags bit 0 is SLIP-19's user-confirmation claim; the host picks it, we only honour it below.
 #
 # The wire result is the full serialized ownership proof: proof_body || bip322_sig
 # (bip322_sig = empty scriptSig (varint 0) || witness stack).
@@ -13,12 +14,11 @@
 #   host collects the result with 'slok'. Only then can the user-confirmation flag be honest.
 import ngu, stash
 from public_constants import AF_P2WPKH, AF_P2TR
-from serializations import ser_compact_size
+from serializations import ser_compact_size, ser_string, ser_string_vector, ser_sig_der
 from auth import UserAuthorizedAction
-from ux import OK, X
+from ux import OK, X, ux_show_story, abort_and_goto
 
 SLIP19_MAGIC = bytes([0x53, 0x4c, 0x00, 0x19])
-FLAG_USER_CONFIRMATION = 0x01
 
 # --- SLIP-19 ownership identifier -------------------------------------------------
 # id = HMAC-SHA256(key = k, msg = scriptPubKey), where
@@ -70,11 +70,8 @@ def _ownership_id_key(sv):
     return k
 
 
-def ownership_id(spk, sv=None):
+def ownership_id(spk, sv):
     # SLIP-19 ownership identifier for one of this wallet's scriptPubKeys.
-    if sv is None:
-        with stash.SensitiveValues() as sv:
-            return ownership_id(spk, sv)
     return bytes(ngu.hmac.hmac_sha256(_ownership_id_key(sv), spk))
 
 
@@ -88,10 +85,12 @@ def _script_and_key(node, addr_fmt):
     # For the key at this node: (scriptPubKey, what signs for it).
     # - P2WPKH: (privkey, compressed pubkey), for an ECDSA/DER witness
     # - P2TR (BIP-86 key-spend): the tweaked keypair, for a BIP-340 witness
+    # Anything else would be signed as taproot below, so it is refused here.
+    assert addr_fmt in (AF_P2WPKH, AF_P2TR), 'unsupported address format for ownership proof'
+
     if addr_fmt == AF_P2WPKH:
         pubkey = node.pubkey()          # 33-byte compressed
-        h160 = ngu.hash.ripemd160(ngu.hash.sha256s(pubkey))
-        return bytes([0x00, 0x14]) + h160, (node.privkey(), pubkey)
+        return bytes([0x00, 0x14]) + ngu.hash.hash160(pubkey), (node.privkey(), pubkey)
 
     # Tweak the internal key with the taproot tweak (no script tree). libsecp256k1's
     # keypair_xonly_tweak_add handles the internal even-Y negation and output-key parity, so the
@@ -103,55 +102,30 @@ def _script_and_key(node, addr_fmt):
     return bytes([0x51, 0x20]) + out_xonly, out_kp               # P2TR: OP_1 push32 <output key>
 
 
-def _check_addr_fmt(addr_fmt):
-    # The caller states the address format, the same way smsg does. Deriving it from the path
-    # purpose instead would be a guess: the purpose does not have to match the script actually
-    # used at that path, and a proof over the wrong scriptPubKey is silently useless.
-    assert addr_fmt in (AF_P2WPKH, AF_P2TR), 'unsupported address format for ownership proof'
-
-
 def make_ownership_proof(subpath, addr_fmt, flags, commitment):
     # subpath: str like "m/84h/0h/0h/1/0"; addr_fmt: AF_P2WPKH or AF_P2TR; commitment: bytes.
-    _check_addr_fmt(addr_fmt)
-
     with stash.SensitiveValues() as sv:
         node = sv.derive_path(subpath)
         spk, signer = _script_and_key(node, addr_fmt)
         oid = ownership_id(spk, sv)
 
     proof_body = SLIP19_MAGIC + bytes([flags & 0xff]) + ser_compact_size(1) + oid
-    preimage = (proof_body + ser_compact_size(len(spk)) + spk
-                + ser_compact_size(len(commitment)) + commitment)
+    preimage = proof_body + ser_string(spk) + ser_string(commitment)
     digest = ngu.hash.sha256s(preimage)
 
     if addr_fmt == AF_P2WPKH:
         pk, pubkey = signer
         sig65 = ngu.secp256k1.sign(pk, digest, 0).to_bytes()
-        der = _der_sig(sig65[1:33], sig65[33:65]) + bytes([0x01])      # + SIGHASH_ALL
-        witness = (ser_compact_size(2) + ser_compact_size(len(der)) + der
-                   + ser_compact_size(len(pubkey)) + pubkey)
+        der = ser_sig_der(sig65[1:33], sig65[33:65])                   # DER + SIGHASH_ALL
+        witness = ser_string_vector([der, pubkey])
     else:
         # aux_rand = 0: BIP-340 permits it; sign32 still binds (secret, message) so it is safe and
         # deterministic for a proof. Witness is a single key-spend sig (SigHash.Default -> 64 bytes).
         sig = ngu.secp256k1.sign_schnorr(signer, digest, bytes(32))
-        witness = ser_compact_size(1) + ser_compact_size(len(sig)) + sig
+        witness = ser_string_vector([sig])
 
     bip322_sig = ser_compact_size(0) + witness       # empty scriptSig, then witness stack
     return proof_body + bip322_sig
-
-
-def _der_sig(r, s):
-    def der_int(x):
-        x = bytes(x)
-        i = 0
-        while i < len(x) - 1 and x[i] == 0:
-            i += 1
-        x = x[i:]
-        if x[0] & 0x80:
-            x = bytes([0]) + x
-        return bytes([0x02, len(x)]) + x
-    body = der_int(r) + der_int(s)
-    return bytes([0x30, len(body)]) + body
 
 
 # --- USB entry points --------------------------------------------------------------
@@ -195,7 +169,6 @@ class ApproveOwnershipProof(UserAuthorizedAction):
         dis.progress_bar_show(1)
 
     async def interact(self):
-        from ux import ux_show_story
         from utils import show_single_address, B2A
 
         story = PROOF_TEMPLATE.format(subpath=self.subpath,
@@ -219,11 +192,12 @@ def usb_ownership_proof(subpath, addr_fmt, flags, commitment):
     # Handle the 'slp9' USB command. Returns the full response (b'biny' + proof) when it can be
     # answered at once (HSM mode), or None once on-screen approval has been started.
     from utils import cleanup_deriv_path
-    from ux import abort_and_goto
     from glob import dis, hsm_active
     from exceptions import HSMDenied
 
-    _check_addr_fmt(addr_fmt)
+    # Reject before deriving anything: the approval screen below renders an address for this
+    # format, and the caller states the format rather than it being guessed from the path.
+    assert addr_fmt in (AF_P2WPKH, AF_P2TR), 'unsupported address format for ownership proof'
 
     # One canonical path is used for BOTH the policy check and the derivation, so a caller
     # cannot get one string approved and a different key signed.

@@ -32,12 +32,11 @@ def slp9_request(subpath, addr_fmt, flags, commitment=COMMITMENT):
 
 
 def poll_slok(dev):
-    for _ in range(200):
-        rv = dev.send_recv(b'slok', timeout=None)
-        if rv is not None:
-            return rv
+    rv = None
+    while rv is None:
         time.sleep(0.050)
-    raise RuntimeError('no proof from slok')
+        rv = dev.send_recv(b'slok', timeout=None)
+    return rv
 
 
 @pytest.fixture
@@ -177,14 +176,15 @@ VECTOR_SPK = bytes.fromhex("0014b2f771c370ccf219cd3059cda92bdf7f00cf2103")
 VECTOR_OID = bytes.fromhex("a122407efc198211c81af4450f40b235d54775efd934d16b9e31c6ce9bad5707")
 
 
-def test_ownership_id_matches_official_vector(set_seed_words, sim_eval):
+def test_ownership_id_matches_official_vector(set_seed_words, sim_exec):
     # Pin the derivation against the published vector, so a change to the SLIP-21 label
     # path or the HMAC ordering fails here rather than in somebody wallet.
     set_seed_words(VECTOR_WORDS)
 
-    rv = sim_eval("__import__(\"binascii\").hexlify("
-                  "__import__(\"slip19\").ownership_id(%r)).decode()" % VECTOR_SPK)
-    assert rv.strip().strip("\x27\"") == VECTOR_OID.hex()
+    rv = sim_exec("import slip19, stash, binascii\n"
+                  "with stash.SensitiveValues() as sv:\n"
+                  "    RV.write(binascii.hexlify(slip19.ownership_id(%r, sv)))" % VECTOR_SPK)
+    assert rv.strip().endswith(VECTOR_OID.hex())
 
 
 def test_slp9_carries_the_real_ownership_id(set_seed_words, slp9):
