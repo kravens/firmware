@@ -1,3 +1,7 @@
+# (c) Copyright 2026 by Coinkite Inc. This file is covered by license found in COPYING-CC.
+#
+# - Thanks to [Kevin Ravensberg](https://github.com/kravens)
+#
 # SLIP-19 ownership proofs (BIP-322-style), for coinjoin remote-signing (e.g. Wasabi WabiSabi).
 # Produces a proof a coordinator verifier accepts: a signature over
 #   SHA256( proof_body || cs(scriptPubKey) || scriptPubKey || cs(commitment) || commitment )
