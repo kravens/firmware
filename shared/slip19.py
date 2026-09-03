@@ -179,7 +179,8 @@ class ApproveOwnershipProof(UserAuthorizedAction):
                                       addr=show_single_address(self.address),
                                       commit=B2A(ngu.hash.sha256s(self.commitment)))
 
-        ch = await ux_show_story(story, title='Ownership Proof')
+        # 12 chars is all the Mk4 title bar fits (see ux_confirm in ux.py)
+        ch = await ux_show_story(story, title='Ownership')
 
         if ch != 'y':
             self.refused = True
